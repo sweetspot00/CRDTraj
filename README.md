@@ -221,20 +221,83 @@ L_ctrl = −E[(R − R̄) · log π_ψ(g)] + β Σ_{t,k} g_k(t)²
 
 ## Data
 
-`SyntheticDataset` in `train.py` is a random-data placeholder. Replace it with a real loader for:
+### ETH/UCY dataset (built-in)
 
-- **ETH/UCY** pedestrian datasets
-- **Stanford Drone Dataset (SDD)**
-- Custom LLM-generated synthetic scenarios (Social Force Model with behavioral specifications)
+The `ETHUCYDataset` in `data/eth_ucy.py` downloads and processes the five standard scenes automatically.
 
-Each sample must yield `(tau0, M, C, S0)`:
+```python
+from data import ETHUCYDataset, ethucy_collate_fn
+from torch.utils.data import DataLoader
 
-| Tensor | Shape | Description |
+# Leave-one-out: train on hotel/univ/zara1/zara2, test on eth
+train_ds = ETHUCYDataset(
+    root="data/eth_ucy",
+    split="train",
+    test_scene="eth",     # held-out test scene
+    obs_len=8,            # 8 observed frames  (3.2 s)
+    pred_len=12,          # 12 predicted frames (4.8 s)
+    min_agents=2,
+    max_agents=8,         # pad/truncate to fixed N; None → variable
+    map_size=224,
+)
+test_ds  = ETHUCYDataset(root="data/eth_ucy", split="test",  test_scene="eth", max_agents=8)
+val_ds   = ETHUCYDataset(root="data/eth_ucy", split="val",   test_scene="eth", max_agents=8)
+
+# Fixed-agent DataLoader (standard)
+loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4)
+
+# Variable-agent DataLoader (uses padding collate)
+loader_var = DataLoader(train_ds, batch_size=32, collate_fn=ethucy_collate_fn, shuffle=True)
+```
+
+**Scenes and files downloaded automatically from Social-STGCNN GitHub mirror:**
+
+| Scene | Raw file(s) | Train / Test |
 |---|---|---|
-| `tau0` | `(N, T, 2)` | Clean ground-truth trajectory (x, y positions) |
-| `M` | `(3, H, W)` | Top-down map image (ImageNet-normalised) |
-| `C` | `(sent_dim,)` | Pre-computed SentenceBERT embedding of context string |
-| `S0` | `(N, 6)` | Initial agent states: `(x₀, y₀, vx₀, vy₀, gx, gy)` |
+| `eth`   | `biwi_eth.txt`                         | test when `test_scene="eth"` |
+| `hotel` | `biwi_hotel.txt`                       | test when `test_scene="hotel"` |
+| `univ`  | `students001.txt` + `students003.txt`  | test when `test_scene="univ"` |
+| `zara1` | `crowds_zara01.txt`                    | test when `test_scene="zara1"` |
+| `zara2` | `crowds_zara02.txt`                    | test when `test_scene="zara2"` |
+
+**Map generation** — since ETH/UCY provides no semantic map images, a top-down
+occupancy map is generated from trajectory density:
+
+- A `(224 × 224)` grid is accumulated from all pedestrian position visits
+- Gaussian-smoothed (σ = 3 px) to fill adjacent walkable cells
+- Normalised to `[0, 1]`: `1.0` = heavily trafficked walkable area, `0.0` = unobserved
+
+Map resolution per scene (approx):
+
+| Scene | m/pixel (x) | m/pixel (y) |
+|---|---|---|
+| eth   | 0.117 | 0.091 |
+| hotel | 0.052 | 0.083 |
+| univ  | 0.089 | 0.081 |
+| zara1 | 0.088 | 0.075 |
+| zara2 | 0.089 | 0.081 |
+
+**Sample contents:**
+
+| Field | Shape | Description |
+|---|---|---|
+| `tau0` | `(N, T, 2)` | Full trajectory in **metres** (obs + pred) |
+| `M`    | `(3, 224, 224)` | Top-down occupancy map, values in **[0, 1]** |
+| `C`    | `(384,)` | Frozen SentenceBERT scene description embedding |
+| `S0`   | `(N, 6)` | `[x₀, y₀, vx₀, vy₀, gx, gy]` — position (m), velocity (m/s), goal (m) |
+
+**Plug into `train.py`** — replace the `SyntheticDataset` block with:
+
+```python
+from data import ETHUCYDataset, ethucy_collate_fn
+
+train_ds = ETHUCYDataset(root="data/eth_ucy", split="train",
+                          test_scene="eth", max_agents=cfg["N_agents"])
+val_ds   = ETHUCYDataset(root="data/eth_ucy", split="val",
+                          test_scene="eth", max_agents=cfg["N_agents"])
+loader   = DataLoader(train_ds, batch_size=cfg["batch_size"],
+                       sampler=sampler, num_workers=cfg["num_workers"])
+```
 
 ---
 

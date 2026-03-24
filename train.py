@@ -22,7 +22,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler
 
 # Optional imports — gracefully degrade if unavailable
 try:
@@ -40,6 +40,8 @@ except ImportError:
 from model import CRDTraj
 from model.reward import total_reward
 from model.controller import reinforce_loss
+from data import ETHUCYDataset, SyntheticDataset, BalancedMixDataset, mixed_collate_fn
+from data.synthetic import CROWD_CATEGORIES
 
 
 # ---------------------------------------------------------------------------
@@ -71,8 +73,23 @@ DEFAULTS = dict(
     # Controller
     beta_ctrl=1e-3,
     rollout_batch=16,
-    # Data
-    data_dir="data/",
+    # Data — ETH/UCY
+    ethucy_root="data/eth_ucy",
+    ethucy_test_scene="eth",
+    # Data — Synthetic SFM
+    synth_results_root=None,    # e.g. "/path/to/sim/results"  (top-level, all scenes)
+    synth_json_root=None,       # e.g. "/path/to/preprocessed_scene"
+    synth_obstacle_root=None,   # e.g. "/path/to/pysfm_obstacles_meter_close_shape"
+    # Comma-separated short_names to restrict scenes, e.g. "00_zurich,01_berkeley"
+    # Leave empty/None to use all discovered scenes.
+    synth_scene_ids=None,
+    # Comma-separated categories to include, e.g. "Escaping,Violent,Dense"
+    # Defaults to all non-Ambulatory crowd categories (CROWD_CATEGORIES).
+    # Pass "ALL" to include every category including Ambulatory.
+    synth_categories=None,
+    # Mix ratio: fraction of each batch drawn from the real (ETH/UCY) dataset.
+    # 0.0 → synthetic only, 1.0 → real only, 0.5 → equal balance.
+    real_ratio=0.5,
     ckpt_dir="checkpoints/",
     resume=None,
     # Misc
@@ -85,33 +102,6 @@ DEFAULTS = dict(
     N_agents=8,
 )
 
-
-# ---------------------------------------------------------------------------
-# Minimal synthetic dataset (placeholder — replace with real data loader)
-# ---------------------------------------------------------------------------
-
-class SyntheticDataset(Dataset):
-    """
-    Generates random trajectories, maps, and context embeddings on-the-fly.
-    Replace this with a real dataset loader for ETH/UCY or SDD.
-    """
-
-    def __init__(self, size: int, T: int, N: int, d_map: int = 224, sent_dim: int = 384):
-        self.size = size
-        self.T = T
-        self.N = N
-        self.d_map = d_map
-        self.sent_dim = sent_dim
-
-    def __len__(self):
-        return self.size
-
-    def __getitem__(self, idx):
-        tau0  = torch.randn(self.N, self.T, 2)          # (N, T, 2) clean traj
-        M     = torch.rand(3, self.d_map, self.d_map)   # (3, H, W) map image
-        C     = torch.randn(self.sent_dim)               # (sent_dim,) context emb
-        S0    = torch.randn(self.N, 6)                   # (N, 6) initial states
-        return tau0, M, C, S0
 
 
 def build_gt_rewards(tau0: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -433,6 +423,79 @@ def load_checkpoint(path: str, model, optimizer=None):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# Dataset construction
+# ---------------------------------------------------------------------------
+
+def _build_dataset(cfg: dict):
+    """
+    Build the training dataset and collate function from config.
+
+    Behaviour depends on which data roots are provided:
+      - Both ethucy_root and synth_sim_root → BalancedMixDataset at real_ratio
+      - Only ethucy_root (or synth roots missing) → ETHUCYDataset only
+      - Only synth roots → SyntheticDataset only
+
+    Returns (dataset, collate_fn).
+    """
+    has_real  = bool(cfg.get("ethucy_root"))
+    has_synth = all(cfg.get(k) for k in ("synth_results_root", "synth_json_root", "synth_obstacle_root"))
+
+    if has_real:
+        real_ds = ETHUCYDataset(
+            root=cfg["ethucy_root"],
+            split="train",
+            test_scene=cfg["ethucy_test_scene"],
+            obs_len=cfg.get("obs_len", 8),
+            pred_len=cfg.get("pred_len", 12),
+            max_agents=cfg["N_agents"],
+        )
+
+    if has_synth:
+        # synth_scene_ids may be a comma-separated string from CLI or a list
+        scene_ids = cfg.get("synth_scene_ids")
+        if isinstance(scene_ids, str) and scene_ids:
+            scene_ids = [s.strip() for s in scene_ids.split(",")]
+        raw_cats = cfg.get("synth_categories")
+        if isinstance(raw_cats, str) and raw_cats and raw_cats.upper() != "ALL":
+            categories = [s.strip() for s in raw_cats.split(",")]
+        elif isinstance(raw_cats, str) and raw_cats.upper() == "ALL":
+            categories = None
+        else:
+            categories = None   # use SyntheticDataset default (CROWD_CATEGORIES)
+
+        synth_ds = SyntheticDataset(
+            results_root=cfg["synth_results_root"],
+            json_root=cfg["synth_json_root"],
+            obstacle_root=cfg["synth_obstacle_root"],
+            scene_ids=scene_ids or None,
+            categories=categories,
+            split="train",
+            obs_len=cfg.get("obs_len", 8),
+            pred_len=cfg.get("pred_len", 12),
+            max_agents=cfg["N_agents"],
+        )
+
+    if has_real and has_synth:
+        dataset = BalancedMixDataset(
+            real_ds, synth_ds,
+            real_ratio=cfg["real_ratio"],
+        )
+        return dataset, mixed_collate_fn
+
+    if has_real:
+        return real_ds, None   # DataLoader default collate (fixed agents)
+
+    if has_synth:
+        from data import synthetic_collate_fn
+        return synth_ds, synthetic_collate_fn
+
+    raise ValueError(
+        "No dataset configured. Provide --ethucy_root and/or "
+        "--synth_sim_root / --synth_json_root / --synth_obstacle_root."
+    )
+
+
+# ---------------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -478,18 +541,14 @@ def main():
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     # Dataset + DataLoader
-    dataset = SyntheticDataset(
-        size=10000,
-        T=cfg["T"],
-        N=cfg["N_agents"],
-        sent_dim=cfg["sent_dim"],
-    )
+    dataset, collate_fn = _build_dataset(cfg)
     sampler = DistributedSampler(dataset) if use_ddp else None
     loader = DataLoader(
         dataset,
         batch_size=cfg["batch_size"],
         sampler=sampler,
         shuffle=(sampler is None),
+        collate_fn=collate_fn,
         num_workers=cfg["num_workers"],
         pin_memory=True,
     )
