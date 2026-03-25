@@ -1,3 +1,4 @@
+# obs_len / pred_len split is only for benchmark eval — training uses the full seq_len window
 """
 NBA SportVU Player-Tracking Dataset.
 
@@ -184,8 +185,7 @@ class NBADataset(Dataset):
     ----------
     nba_root    : directory containing train.npy / test.npy
     split       : 'train' | 'val' | 'test'
-    obs_len     : observed frames (at target_dt)
-    pred_len    : predicted frames (at target_dt)
+    seq_len     : total trajectory window length in frames (at target_dt)
     target_dt   : resample raw 25 Hz data to this time step (seconds)
     max_agents  : truncate agents; default None keeps all 11
     use_metres  : convert feet to metres (default True)
@@ -196,8 +196,7 @@ class NBADataset(Dataset):
         self,
         nba_root: str,
         split: Literal["train", "val", "test"] = "train",
-        obs_len: int = 5,     # 2 s observed at 0.4 s/frame
-        pred_len: int = 10,   # 4 s predicted
+        seq_len: int = 15,    # 6 s total at 0.4 s/frame
         target_dt: float = TARGET_DT,
         min_agents: int = 5,
         max_agents: int | None = 11,
@@ -208,9 +207,7 @@ class NBADataset(Dataset):
         use_metres: bool = True,
     ):
         super().__init__()
-        self.obs_len    = obs_len
-        self.pred_len   = pred_len
-        self.seq_len    = obs_len + pred_len
+        self.seq_len    = seq_len
         self.max_agents = max_agents
         self.target_dt  = target_dt
         self.sent_dim   = sent_dim

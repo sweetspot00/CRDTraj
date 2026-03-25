@@ -1,3 +1,4 @@
+# obs_len / pred_len split is only for benchmark eval — training uses the full seq_len window
 """
 Stanford Drone Dataset (SDD) dataloader.
 
@@ -35,6 +36,8 @@ import hashlib
 from pathlib import Path
 from typing import Literal
 
+from data.cache import DatasetCache, cache_name, DEFAULT_CACHE_DIR
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -57,8 +60,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 MAP_SIZE     = 224
-OBS_LEN      = 8
-PRED_LEN     = 12
+SEQ_LEN      = 20
 DT           = 0.4      # seconds per frame after 2.5 fps subsampling (25fps / 10)
 RAW_FPS      = 30       # SDD raw frame rate (approx)
 TARGET_FPS   = 2.5      # standard SDD evaluation frequency
@@ -264,8 +266,7 @@ class SDDDataset(Dataset):
     scenes      : list of scene names to include (None = all 8 scenes)
     split       : 'train' | 'val' | 'test'
     test_scenes : scenes held out for testing (leave-one-out); None uses val_frac only
-    obs_len     : observed frames
-    pred_len    : predicted frames
+    seq_len     : total trajectory window length in frames
     min_agents  : minimum co-present pedestrians
     max_agents  : pad/truncate agents (None = variable)
     map_size    : output map resolution (pixels)
@@ -281,8 +282,7 @@ class SDDDataset(Dataset):
         scenes: list[str] | None = None,
         split: Literal["train", "val", "test"] = "train",
         test_scenes: list[str] | None = None,
-        obs_len: int = OBS_LEN,
-        pred_len: int = PRED_LEN,
+        seq_len: int = SEQ_LEN,
         min_agents: int = 2,
         max_agents: int | None = None,
         map_size: int = MAP_SIZE,
@@ -290,11 +290,10 @@ class SDDDataset(Dataset):
         sbert_model: str = "all-MiniLM-L6-v2",
         val_frac: float = 0.1,
         stride: int | None = None,
+        cache_dir: str | None = None,
     ):
         super().__init__()
-        self.obs_len    = obs_len
-        self.pred_len   = pred_len
-        self.seq_len    = obs_len + pred_len
+        self.seq_len    = seq_len
         self.max_agents = max_agents
         self.sent_dim   = sent_dim
         self.dt         = DT
@@ -310,12 +309,25 @@ class SDDDataset(Dataset):
         elif split in ("train", "val"):
             active = [s for s in active if s not in test_set]
 
+        _cache_root = Path(cache_dir) if cache_dir else DEFAULT_CACHE_DIR
+        _cname = cache_name(
+            dataset="sdd", split=split,
+            scenes=sorted(active), test=sorted(test_set),
+            seq=seq_len, stride=_stride,
+            N=max_agents or "var", valf=val_frac,
+        )
+        disk_cache = DatasetCache(_cache_root, _cname)
+
+        if disk_cache.exists():
+            self._samples = disk_cache.load()
+            print(f"[SDD] loaded from cache  split={split:5s}  windows={len(self._samples):5d}")
+            return
+
         scales = _load_scales(sdd_root)
         sbert  = _try_load_sbert(sbert_model)
-        cache_dir = sdd_root / "cache" / "ctx"
+        ctx_dir = sdd_root / "cache" / "ctx"
 
         self._samples: list[tuple[np.ndarray, torch.Tensor, torch.Tensor]] = []
-        # (traj (N,T,2), M (3,H,W), C (sent_dim,))
 
         for scene in active:
             scene_dir = ann_root / scene
@@ -323,7 +335,7 @@ class SDDDataset(Dataset):
                 continue
 
             ctx = SCENE_DESCRIPTIONS.get(scene, f"Pedestrians at {scene}")
-            C   = _embed(ctx, sent_dim, sbert, cache_dir)
+            C   = _embed(ctx, sent_dim, sbert, ctx_dir)
 
             for video_dir in sorted(scene_dir.iterdir()):
                 if not video_dir.is_dir():
@@ -366,6 +378,7 @@ class SDDDataset(Dataset):
             f"[SDD] split={split:5s}  scenes={active}  "
             f"windows={len(self._samples):5d}"
         )
+        disk_cache.save(self._samples)
 
     def __len__(self) -> int:
         return len(self._samples)
@@ -458,8 +471,7 @@ class GCSDataset(Dataset):
     ----------
     gcs_root  : path containing annotation/, homography/, segmentation/
     split     : 'train' | 'val' | 'test'
-    obs_len   : observed frames (default 8)
-    pred_len  : predicted frames (default 12)
+    seq_len   : total trajectory window length in frames (default 20)
     target_dt : desired time step in seconds (raw dt ≈ 0.4 s at 2.5 fps assumed)
     """
 
@@ -467,8 +479,7 @@ class GCSDataset(Dataset):
         self,
         gcs_root: str,
         split: Literal["train", "val", "test"] = "train",
-        obs_len: int = OBS_LEN,
-        pred_len: int = PRED_LEN,
+        seq_len: int = SEQ_LEN,
         target_dt: float = DT,
         min_agents: int = 2,
         max_agents: int | None = None,
@@ -477,28 +488,41 @@ class GCSDataset(Dataset):
         sbert_model: str = "all-MiniLM-L6-v2",
         val_frac: float = 0.1,
         stride: int | None = None,
+        cache_dir: str | None = None,
     ):
         super().__init__()
-        self.obs_len    = obs_len
-        self.pred_len   = pred_len
-        self.seq_len    = obs_len + pred_len
+        self.seq_len    = seq_len
         self.max_agents = max_agents
         self.sent_dim   = sent_dim
         self.dt         = target_dt
 
         gcs_root  = Path(gcs_root)
-        ann_dir   = gcs_root / "annotation"
-        h_path    = gcs_root / "homography" / "terminal_H.txt"
-        cache_dir = gcs_root / "cache" / "ctx"
         _stride   = stride if stride is not None else self.seq_len
 
-        H   = _load_homography(h_path)
-        M   = _load_gcs_seg_map(gcs_root, map_size)
+        _cache_root = Path(cache_dir) if cache_dir else DEFAULT_CACHE_DIR
+        _cname = cache_name(
+            dataset="gcs", split=split,
+            seq=seq_len, stride=_stride,
+            N=max_agents or "var", valf=val_frac,
+        )
+        disk_cache = DatasetCache(_cache_root, _cname)
 
-        sbert = _try_load_sbert(sbert_model)
-        C     = _embed(GCS_DESCRIPTION, sent_dim, sbert, cache_dir)
+        H = _load_homography(gcs_root / "homography" / "terminal_H.txt")
+        M = _load_gcs_seg_map(gcs_root, map_size)
+
+        sbert   = _try_load_sbert(sbert_model)
+        ctx_dir = gcs_root / "cache" / "ctx"
+        C       = _embed(GCS_DESCRIPTION, sent_dim, sbert, ctx_dir)
+
+        if disk_cache.exists():
+            self._windows = disk_cache.load()
+            self._M = M
+            self._C = C
+            print(f"[GCS] loaded from cache  split={split:5s}  windows={len(self._windows):5d}")
+            return
 
         # ── Load all frames ────────────────────────────────────────────────
+        ann_dir = gcs_root / "annotation"
         # GCS: frame files are named 000001.txt … 012684.txt
         frame_files = sorted(ann_dir.glob("*.txt"))
         frame_data: dict[int, dict[int, np.ndarray]] = {}   # {frame: {ped_id: (x,y)}}
@@ -557,6 +581,7 @@ class GCSDataset(Dataset):
         self._C        = C
         assert windows, f"[GCS] No windows for split='{split}'"
         print(f"[GCS] split={split:5s}  windows={len(windows):5d}")
+        disk_cache.save(windows)
 
     def __len__(self) -> int:
         return len(self._windows)

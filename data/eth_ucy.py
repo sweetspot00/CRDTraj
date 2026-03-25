@@ -1,3 +1,4 @@
+# obs_len / pred_len split is only for benchmark eval — training uses the full seq_len window
 """
 ETH/UCY Pedestrian Dataset Loader for CRDTraj.
 
@@ -28,6 +29,8 @@ import math
 import urllib.request
 from pathlib import Path
 from typing import Literal
+
+from data.cache import DatasetCache, cache_name, DEFAULT_CACHE_DIR
 
 import numpy as np
 import torch
@@ -398,8 +401,7 @@ class ETHUCYDataset(Dataset):
     root           : directory for raw files and caches
     split          : 'train' | 'val' | 'test'
     test_scene     : held-out scene for the LOO benchmark (default 'eth')
-    obs_len        : observed frames (default 8 → 3.2 s)
-    pred_len       : future frames to predict (default 12 → 4.8 s)
+    seq_len        : trajectory window length in frames (default 20 = 8 s at 0.4 s/frame)
     min_agents     : drop windows with fewer agents (default 2)
     max_agents     : pad/truncate all sequences to this agent count;
                      None keeps the natural per-window count (requires
@@ -421,8 +423,7 @@ class ETHUCYDataset(Dataset):
         root: str = "data/eth_ucy",
         split: Literal["train", "val", "test"] = "train",
         test_scene: str = "eth",
-        obs_len: int = 8,
-        pred_len: int = 12,
+        seq_len: int = 20,
         min_agents: int = 2,
         max_agents: int | None = None,
         map_size: int = MAP_SIZE,
@@ -432,6 +433,7 @@ class ETHUCYDataset(Dataset):
         val_frac: float = 0.1,
         stride: int = 1,
         normalize_traj: bool = False,
+        cache_dir: str | None = None,
     ):
         super().__init__()
         assert test_scene in self.SCENE_NAMES, (
@@ -442,9 +444,7 @@ class ETHUCYDataset(Dataset):
         self.root = Path(root)
         self.split = split
         self.test_scene = test_scene
-        self.obs_len = obs_len
-        self.pred_len = pred_len
-        self.seq_len = obs_len + pred_len
+        self.seq_len = seq_len
         self.min_agents = min_agents
         self.max_agents = max_agents
         self.map_size = map_size
@@ -452,6 +452,24 @@ class ETHUCYDataset(Dataset):
         self.sent_dim = sent_dim
         self.dt = DT
         self.normalize_traj = normalize_traj
+
+        # ── Disk cache ─────────────────────────────────────────────────────
+        _cache_root = Path(cache_dir) if cache_dir else DEFAULT_CACHE_DIR
+        _cname = cache_name(
+            dataset="ethucy", split=split, test=test_scene,
+            seq=seq_len, stride=stride,
+            N=max_agents or "var", sigma=map_sigma, valf=val_frac,
+            norm=normalize_traj,
+        )
+        disk_cache = DatasetCache(_cache_root, _cname)
+
+        if disk_cache.exists():
+            self._samples, self._scene_map, self._scene_ctx = disk_cache.load()
+            print(
+                f"[ETH/UCY] loaded from cache  split={split:5s}  "
+                f"test_scene={test_scene}  sequences={len(self._samples):5d}"
+            )
+            return
 
         # ── Download raw files ──────────────────────────────────────────────
         scene_paths = download_all_scenes(self.root)
@@ -526,6 +544,7 @@ class ETHUCYDataset(Dataset):
             f"[ETH/UCY] split={split:5s}  test_scene={test_scene}  "
             f"sequences={len(self._samples):5d}"
         )
+        disk_cache.save((self._samples, self._scene_map, self._scene_ctx))
 
     # ── Dataset interface ────────────────────────────────────────────────────
 

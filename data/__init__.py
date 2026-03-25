@@ -3,6 +3,7 @@ from .synthetic import SyntheticDataset, synthetic_collate_fn
 from .combined import BalancedMixDataset, mixed_collate_fn
 from .sdd import SDDDataset, GCSDataset
 from .nba import NBADataset
+from .edin import EDINDataset
 
 __all__ = [
     "ETHUCYDataset", "ethucy_collate_fn",
@@ -11,4 +12,5 @@ __all__ = [
     "SDDDataset",
     "GCSDataset",
     "NBADataset",
+    "EDINDataset",
 ]

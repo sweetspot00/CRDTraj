@@ -1,3 +1,4 @@
+# obs_len / pred_len split is only for benchmark eval — training uses the full seq_len window
 """
 Synthetic dataset loader for CRDTraj.
 
@@ -50,6 +51,8 @@ import tomllib
 from pathlib import Path
 from typing import Literal
 
+from data.cache import DatasetCache, cache_name, DEFAULT_CACHE_DIR
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -65,8 +68,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 MAP_SIZE = 224
-OBS_LEN_DEFAULT = 8
-PRED_LEN_DEFAULT = 12
+SEQ_LEN_DEFAULT = 20
 TARGET_DT_DEFAULT = 0.4   # seconds
 
 CATEGORY_DESCRIPTIONS: dict[str, str] = {
@@ -349,8 +351,7 @@ class SyntheticDataset(Dataset):
                     Defaults to CROWD_CATEGORIES (all except "Ambulatory"), since
                     ETH/UCY already covers normal walking.  Pass None to keep all.
     split         : 'train' | 'val' | 'test'
-    obs_len       : observed frames
-    pred_len      : predicted frames
+    seq_len       : total trajectory window length in frames
     target_dt     : resample all sims to this Δt (seconds)
     min_agents    : skip windows with fewer agents
     max_agents    : pad/truncate to this agent count (None = variable)
@@ -370,8 +371,7 @@ class SyntheticDataset(Dataset):
         scene_ids: list[str] | None = None,
         categories: set[str] | list[str] | None = CROWD_CATEGORIES,
         split: Literal["train", "val", "test"] = "train",
-        obs_len: int = OBS_LEN_DEFAULT,
-        pred_len: int = PRED_LEN_DEFAULT,
+        seq_len: int = SEQ_LEN_DEFAULT,
         target_dt: float = TARGET_DT_DEFAULT,
         min_agents: int = 2,
         max_agents: int | None = None,
@@ -381,11 +381,10 @@ class SyntheticDataset(Dataset):
         sbert_model: str = "all-MiniLM-L6-v2",
         val_frac: float = 0.1,
         stride: int | None = None,
+        cache_dir: str | None = None,   # set to save/load processed samples
     ):
         super().__init__()
-        self.obs_len      = obs_len
-        self.pred_len     = pred_len
-        self.seq_len      = obs_len + pred_len
+        self.seq_len      = seq_len
         self.target_dt    = target_dt
         self.max_agents   = max_agents
         self.map_size     = map_size
@@ -397,17 +396,40 @@ class SyntheticDataset(Dataset):
         obstacle_root = Path(obstacle_root)
         _stride = stride if stride is not None else self.seq_len
 
+        # ── Disk cache for processed samples ──────────────────────────────
+        _cache_dir = Path(cache_dir) if cache_dir else DEFAULT_CACHE_DIR
+        _cname = cache_name(
+            dataset="synthetic",
+            split=split,
+            scenes=sorted(scene_ids) if scene_ids else "all",
+            cats=sorted(categories) if categories else "all",
+            seq=seq_len,
+            dt=target_dt, stride=_stride,
+            N=max_agents or "var",
+            dilate=dilate_px,
+            valf=val_frac,
+        )
+        disk_cache = DatasetCache(_cache_dir, _cname)
+
+        if disk_cache.exists():
+            self._samples = disk_cache.load()
+            cats_str = ", ".join(sorted(self._categories)) if self._categories else "ALL"
+            print(
+                f"[Synthetic] loaded from cache  split={split:5s}  "
+                f"windows={len(self._samples):6d}  categories=[{cats_str}]"
+            )
+            return
+
         # ── Discover scenes ────────────────────────────────────────────────
         scenes = discover_scenes(results_root, json_root, obstacle_root, include=scene_ids)
         assert scenes, f"No valid scenes found under {results_root}"
 
-        # ── SBERT + cache ──────────────────────────────────────────────────
+        # ── SBERT + ctx cache ──────────────────────────────────────────────
         sbert     = _try_load_sbert(sbert_model)
-        cache_dir = results_root / "cache" / "ctx"
+        ctx_cache = results_root / "cache" / "ctx"
 
         # ── Load all samples ───────────────────────────────────────────────
         self._samples: list[tuple[np.ndarray, torch.Tensor, torch.Tensor, dict]] = []
-        # (traj (N,T,2), M (3,H,W), C (sent_dim,), meta)
 
         scene_window_counts = []
 
@@ -448,7 +470,7 @@ class SyntheticDataset(Dataset):
                     continue
 
                 ctx_text = f"{scenario} [{CATEGORY_DESCRIPTIONS.get(category, category)}]"
-                C = _embed(ctx_text, sent_dim, sbert, cache_dir)
+                C = _embed(ctx_text, sent_dim, sbert, ctx_cache)
 
                 meta = {
                     "scene_index":    scene_index,
@@ -496,6 +518,7 @@ class SyntheticDataset(Dataset):
             f"(total before split: {n})  "
             f"categories=[{cats_str}]"
         )
+        disk_cache.save(self._samples)
 
     # ── Dataset interface ─────────────────────────────────────────────────────
 

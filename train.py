@@ -89,6 +89,7 @@ DEFAULTS = dict(
     synth_categories=None,
     # Mix ratio: fraction of each batch drawn from the real (ETH/UCY) dataset.
     # 0.0 → synthetic only, 1.0 → real only, 0.5 → equal balance.
+    seq_len=20,
     real_ratio=0.5,
     ckpt_dir="checkpoints/",
     resume=None,
@@ -197,10 +198,12 @@ def train_stage1(model, loader, optimizer, scheduler, logger, cfg, start_epoch=0
     for epoch in range(start_epoch, cfg["stage1_epochs"]):
         if hasattr(loader.sampler, "set_epoch"):
             loader.sampler.set_epoch(epoch)
+        if hasattr(loader.dataset, "reshuffle"):
+            loader.dataset.reshuffle()
 
         model.train()
         for batch in loader:
-            tau0, M, C, S0 = [x.to(device) for x in batch]
+            tau0, M, C, S0 = batch[0].to(device), batch[1].to(device), batch[2].to(device), batch[3].to(device)
 
             # Ground-truth rewards on clean trajectories
             with torch.no_grad():
@@ -267,7 +270,7 @@ def train_stage2(model, loader, optimizer, logger, cfg, start_epoch=0):
         gate_history = []      # for heatmap logging
 
         for batch in loader:
-            _, M, C, S0 = [x.to(device) for x in batch]
+            _, M, C, S0 = batch[0], batch[1].to(device), batch[2].to(device), batch[3].to(device)
             B = M.shape[0]
 
             optimizer.zero_grad()
@@ -445,8 +448,7 @@ def _build_dataset(cfg: dict):
             root=cfg["ethucy_root"],
             split="train",
             test_scene=cfg["ethucy_test_scene"],
-            obs_len=cfg.get("obs_len", 8),
-            pred_len=cfg.get("pred_len", 12),
+            seq_len=cfg.get("seq_len", 20),
             max_agents=cfg["N_agents"],
         )
 
@@ -470,8 +472,7 @@ def _build_dataset(cfg: dict):
             scene_ids=scene_ids or None,
             categories=categories,
             split="train",
-            obs_len=cfg.get("obs_len", 8),
-            pred_len=cfg.get("pred_len", 12),
+            seq_len=cfg.get("seq_len", 20),
             max_agents=cfg["N_agents"],
         )
 
@@ -518,7 +519,12 @@ def main():
         local_rank = setup_ddp()
         device = torch.device(f"cuda:{local_rank}")
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
         local_rank = 0
 
     torch.manual_seed(cfg["seed"] + local_rank)
@@ -550,7 +556,7 @@ def main():
         shuffle=(sampler is None),
         collate_fn=collate_fn,
         num_workers=cfg["num_workers"],
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
     )
 
     logger = Logger(cfg, cfg["use_wandb"], cfg["use_tb"])

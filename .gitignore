@@ -1,3 +1,7 @@
 /.claude
 *.pt
-*.pyc
+*.pycdata/.cache/
+*__pycache__/
+*wandb/
+*checkpoints/
+*.log
